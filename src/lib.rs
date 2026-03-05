@@ -10,7 +10,7 @@ use tokio::time::{sleep, Duration};
 
 pub mod api;
 
-pub use api::{HttpResponse, PipeTransport};
+pub use api::{HttpResponse, PipeStream, PipeTransport};
 
 #[derive(Debug, Error)]
 pub enum ProcessError {

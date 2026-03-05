@@ -1,10 +1,12 @@
 use std::io;
 
 use log::debug;
+use serde::de::DeserializeOwned;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::windows::named_pipe::ClientOptions;
 use tokio::time::{timeout, Duration};
 
+use super::stream::PipeStream;
 use crate::ProcessError;
 
 /// 默认 named pipe 地址
@@ -100,6 +102,46 @@ impl PipeTransport {
     /// 发送 DELETE 请求。
     pub async fn delete(&self, path: &str) -> Result<HttpResponse, ProcessError> {
         self.request("DELETE", path, None).await
+    }
+
+    // ── 流式请求 ─────────────────────────────────────────────────────
+
+    /// 发送 GET 请求并返回一个流式读取器 [`PipeStream`]。
+    ///
+    /// 适用于 mihomo 的流式端点（`/logs`、`/traffic`、`/memory`、
+    /// `/connections`），这些端点保持连接打开并持续输出换行分隔的 JSON 对象。
+    ///
+    /// 返回的 `PipeStream<T>` 实现了 `futures_core::Stream<Item = Result<T, ProcessError>>`，
+    /// 每次 `poll_next` / `.next().await` 产生一个反序列化后的 `T`。
+    ///
+    /// 丢弃 (drop) `PipeStream` 即可关闭管道连接，取消订阅。
+    ///
+    /// ```ignore
+    /// use futures_core::Stream;
+    /// use tokio_stream::StreamExt; // 或 futures::StreamExt
+    ///
+    /// let stream = transport.stream_get::<TrafficEntry>("/traffic").await?;
+    /// tokio::pin!(stream);
+    /// while let Some(Ok(entry)) = stream.next().await {
+    ///     println!("up={} down={}", entry.up, entry.down);
+    /// }
+    /// ```
+    pub async fn stream_get<T: DeserializeOwned>(
+        &self,
+        path: &str,
+    ) -> Result<PipeStream<T>, ProcessError> {
+        let raw_request = self.build_request("GET", path, None);
+
+        debug!("pipe stream request: GET {}", path);
+
+        // 连接 pipe
+        let mut pipe = self.connect_pipe().await?;
+
+        // 写入 HTTP 请求
+        pipe.write_all(&raw_request).await?;
+
+        // 返回流式读取器 —— 不等待响应头，由 PipeStream 内部按需解析
+        Ok(PipeStream::new(pipe))
     }
 
     // ── 内部实现 ─────────────────────────────────────────────────────

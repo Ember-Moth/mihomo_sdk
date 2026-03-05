@@ -1,4 +1,5 @@
 use crate::api::models::*;
+use crate::api::stream::PipeStream;
 use crate::{MihomoManager, ProcessError};
 
 /// Helper: parse JSON body from an HTTP response, returning a typed result.
@@ -584,5 +585,131 @@ impl MihomoManager {
     pub async fn debug_gc(&self) -> Result<(), ProcessError> {
         self.api().put("/debug/gc", "").await?;
         Ok(())
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Streaming endpoints (logs / traffic / memory / connections)
+// ═══════════════════════════════════════════════════════════════════════
+
+impl MihomoManager {
+    /// GET /traffic — 流式订阅实时流量数据。
+    ///
+    /// 每隔约 1 秒产生一个 [`TrafficEntry`]，包含瞬时上下行速率和累计总量。
+    ///
+    /// Source: `hub/route/server.go` — `traffic` handler.
+    ///
+    /// ```ignore
+    /// use tokio_stream::StreamExt;
+    ///
+    /// let stream = mgr.stream_traffic().await?;
+    /// tokio::pin!(stream);
+    /// while let Some(Ok(entry)) = stream.next().await {
+    ///     println!("↑ {} B/s  ↓ {} B/s", entry.up, entry.down);
+    /// }
+    /// ```
+    pub async fn stream_traffic(&self) -> Result<PipeStream<TrafficEntry>, ProcessError> {
+        self.api().stream_get("/traffic").await
+    }
+
+    /// GET /memory — 流式订阅实时内存使用数据。
+    ///
+    /// 每隔约 1 秒产生一个 [`MemoryEntry`]，包含当前堆内存使用量和 OS 限制。
+    ///
+    /// Source: `hub/route/server.go` — `memory` handler.
+    ///
+    /// ```ignore
+    /// use tokio_stream::StreamExt;
+    ///
+    /// let stream = mgr.stream_memory().await?;
+    /// tokio::pin!(stream);
+    /// while let Some(Ok(entry)) = stream.next().await {
+    ///     println!("memory inuse: {} bytes", entry.inuse);
+    /// }
+    /// ```
+    pub async fn stream_memory(&self) -> Result<PipeStream<MemoryEntry>, ProcessError> {
+        self.api().stream_get("/memory").await
+    }
+
+    /// GET /logs — 流式订阅日志（默认格式）。
+    ///
+    /// 持续产生 [`LogEntry`]，每条包含 `level`（`"info"` / `"warning"` /
+    /// `"error"` / `"debug"`）和 `payload`（日志正文）。
+    ///
+    /// 可通过 `level` 参数过滤最低日志级别（`"debug"` / `"info"` /
+    /// `"warning"` / `"error"` / `"silent"`）。传入空字符串则不过滤。
+    ///
+    /// Source: `hub/route/server.go` — `getLogs` handler.
+    ///
+    /// ```ignore
+    /// use tokio_stream::StreamExt;
+    ///
+    /// let stream = mgr.stream_logs("info").await?;
+    /// tokio::pin!(stream);
+    /// while let Some(Ok(entry)) = stream.next().await {
+    ///     println!("[{}] {}", entry.level, entry.payload);
+    /// }
+    /// ```
+    pub async fn stream_logs(&self, level: &str) -> Result<PipeStream<LogEntry>, ProcessError> {
+        let path = if level.is_empty() {
+            "/logs".to_string()
+        } else {
+            format!("/logs?level={}", urlencoded(level))
+        };
+        self.api().stream_get(&path).await
+    }
+
+    /// GET /logs?format=structured — 流式订阅结构化日志。
+    ///
+    /// 与 [`stream_logs`](Self::stream_logs) 类似，但返回
+    /// [`LogStructured`] 格式，包含 `time`、`level`、`message` 及
+    /// 可选的 `fields` 数组。
+    ///
+    /// Source: `hub/route/server.go` — `getLogs` handler with `format=structured`.
+    ///
+    /// ```ignore
+    /// use tokio_stream::StreamExt;
+    ///
+    /// let stream = mgr.stream_logs_structured("debug").await?;
+    /// tokio::pin!(stream);
+    /// while let Some(Ok(entry)) = stream.next().await {
+    ///     println!("[{}] {} {}", entry.time, entry.level, entry.message);
+    /// }
+    /// ```
+    pub async fn stream_logs_structured(
+        &self,
+        level: &str,
+    ) -> Result<PipeStream<LogStructured>, ProcessError> {
+        let mut path = "/logs?format=structured".to_string();
+        if !level.is_empty() {
+            path.push_str(&format!("&level={}", urlencoded(level)));
+        }
+        self.api().stream_get(&path).await
+    }
+
+    /// GET /connections — 流式订阅连接快照。
+    ///
+    /// 持续产生 [`ConnectionsResponse`]，每次包含当前所有活跃连接的完整快照
+    /// （包括上下行总量、连接列表、内存使用等）。
+    ///
+    /// 与 [`get_connections`](Self::get_connections) 不同，此方法保持连接
+    /// 打开并持续接收更新。
+    ///
+    /// Source: `hub/route/connections.go` — `getConnections` (streaming path).
+    ///
+    /// ```ignore
+    /// use tokio_stream::StreamExt;
+    ///
+    /// let stream = mgr.stream_connections().await?;
+    /// tokio::pin!(stream);
+    /// while let Some(Ok(snapshot)) = stream.next().await {
+    ///     let count = snapshot.connections.as_ref().map_or(0, |c| c.len());
+    ///     println!("active connections: {}", count);
+    /// }
+    /// ```
+    pub async fn stream_connections(
+        &self,
+    ) -> Result<PipeStream<ConnectionsResponse>, ProcessError> {
+        self.api().stream_get("/connections").await
     }
 }
